@@ -1,0 +1,106 @@
+name: Build FairPlayed On-Device (unsigned IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'FairPlayed/**'
+      - '.github/workflows/build-unsigned.yml'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          rustc --version
+          cargo --version
+          if ! command -v cmake >/dev/null 2>&1; then brew install cmake; fi
+          cmake --version
+
+      - name: Install iOS Rust target and matching LLVM tools
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          # Use llvm-nm shipped with the same rustup toolchain as rustc.
+          # Xcode's Apple nm can be too old to read newer Rust LLVM objects.
+          rustup component add llvm-tools-preview
+
+      - name: Build Airlift Rust static library for iOS arm64
+        working-directory: FairPlayed/Airlift/rust-core
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: '18.0'
+          CMAKE_BUILD_PARALLEL_LEVEL: '3'
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target aarch64-apple-ios
+          LIBAIRLIFT="$PWD/target/aarch64-apple-ios/release/libairlift_ffi.a"
+          test -s "$LIBAIRLIFT"
+
+          # Xcode's /usr/bin/nm may use an older LLVM reader and fail on
+          # object attributes emitted by the current rustc LLVM version.
+          # Read the archive with llvm-nm from the same rustup toolchain.
+          RUST_SYSROOT="$(rustc --print sysroot)"
+          RUST_HOST="$(rustc -vV | sed -n 's/^host: //p')"
+          LLVM_NM="$RUST_SYSROOT/lib/rustlib/$RUST_HOST/bin/llvm-nm"
+          if [ ! -x "$LLVM_NM" ]; then
+            echo "llvm-nm was not found at: $LLVM_NM" >&2
+            find "$RUST_SYSROOT/lib/rustlib" -type f -name llvm-nm -print >&2 || true
+            exit 1
+          fi
+          "$LLVM_NM" --version
+          "$LLVM_NM" -g "$LIBAIRLIFT" > /tmp/airlift-symbols.txt
+          grep -q 'al_pairing_run_host' /tmp/airlift-symbols.txt
+          grep -q 'al_list_app_containers' /tmp/airlift-symbols.txt
+          grep -q 'al_exploit_read_afc_only_folder' /tmp/airlift-symbols.txt
+          grep -q 'al_exploit_read_folder' /tmp/airlift-symbols.txt
+          echo "Airlift FFI exports verified."
+          ls -lh target/aarch64-apple-ios/release/libairlift_ffi.a
+
+      - name: Build FairPlayed without signing
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/Release-iphoneos build/Intermediates
+          xcodebuild \
+            -project FairPlayed/FairPlayed.xcodeproj \
+            -target FairPlayed \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
+            OBJROOT="$PWD/build/Intermediates" \
+            IPHONEOS_DEPLOYMENT_TARGET=18.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/Release-iphoneos/FairPlayed.app"
+          test -d "$APP"
+          mkdir -p package/Payload
+          ditto "$APP" package/Payload/FairPlayed.app
+          (cd package && /usr/bin/zip -qry "$GITHUB_WORKSPACE/FairPlayed-OnDevice-unsigned.ipa" Payload)
+          test -s FairPlayed-OnDevice-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FairPlayed-OnDevice-unsigned-IPA
+          path: FairPlayed-OnDevice-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
