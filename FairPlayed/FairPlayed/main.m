@@ -745,7 +745,7 @@ static NSString *WorkDir(void) {
         }
         case 4: {
             self.pickingPairingFile = YES;
-            NSArray *types = @[UTType.propertyList, UTType.data];
+            NSArray *types = @[UTTypePropertyList, UTTypeData];
             UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
             p.delegate = self;
             [self presentViewController:p animated:YES completion:nil];
